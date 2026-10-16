@@ -95,6 +95,28 @@ public:
     int sigPipeFd() const;
 
     /*!
+     * Record an arriving Unix signal for the main loop and say whether the
+     * caller must write the wakeup byte into the signal pipe.
+     *
+     * Called from a signal handler, so it only touches sig_atomic_t state.
+     * Returns false when a wakeup byte is already pending - the pipe may be
+     * full, and one byte per drain is enough because the loop handles every
+     * recorded signal.
+     */
+    bool noteSignal(int signum);
+
+    /*!
+     * Take the next recorded signal number and clear it, or 0 when none is
+     * left. Called from the main loop once it drained the signal pipe.
+     */
+    int takePendingSignal();
+
+    /*!
+     * Clear the wakeup byte flag once the main loop read that byte.
+     */
+    void clearSigWakeup();
+
+    /*!
      * Set unix signal handler and save its original value.
      */
     void setUnixSignalHandler(int signum, sighandler_t handler);
@@ -178,8 +200,16 @@ private:
     //! some parameters.
     int m_boosterLauncherSocket[2];
 
-    //! Pipe used to safely catch Unix signals
+    //! Pipe used to safely catch Unix signals. It only carries wakeup bytes,
+    //! one per drain, because the handler must never block on a full pipe.
     int m_sigPipeFd[2];
+
+    //! Signals the handler recorded, as a bit per signal number. The pipe
+    //! byte is only a wakeup, so a full pipe cannot lose a signal.
+    volatile sig_atomic_t m_sigPending;
+
+    //! True while a wakeup byte is in the signal pipe (or being written)
+    volatile sig_atomic_t m_sigWakeupSent;
 
     //! Argument vector initially given to the launcher process
     int m_initialArgc;

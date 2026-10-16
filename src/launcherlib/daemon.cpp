@@ -113,8 +113,20 @@ static void write_to_signal_pipe(int sig)
     }
 #endif
 
+    /* Record the signal first: the byte written below is only a wakeup, and a
+     * full pipe drops it rather than blocking here. The main loop handles
+     * every recorded signal, so nothing is lost. */
+    if (!Daemon::instance()->noteSignal(sig))
+        return;
+
     char v = (char)sig;
     if (write(Daemon::instance()->sigPipeFd(), &v, 1) != 1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* Signal pipe full: the recorded signal is handled when the loop
+             * drains the pipe. Blocking here instead used to park the process
+             * in pipe_write forever (issue #16). */
+            return;
+        }
         /* If we can't write to internal signal forwarding
          * pipe, we might as well quit */
         const char m[] = "*** signal pipe write failure - terminating\n";
@@ -300,6 +312,8 @@ Daemon::Daemon(int & argc, char * argv[]) :
     m_debugMode(false),
     m_bootMode(false),
     m_boosterPid(0),
+    m_sigPending(0),
+    m_sigWakeupSent(0),
     m_socketManager(new SocketManager),
     m_singleInstance(new SingleInstance),
     m_notifySystemd(false),
@@ -316,7 +330,12 @@ Daemon::Daemon(int & argc, char * argv[]) :
     setUnixSignalHandler(SIGTERM, write_to_signal_pipe); // exit launcher
     setUnixSignalHandler(SIGUSR1, write_to_signal_pipe); // enter normal mode from boot mode
     setUnixSignalHandler(SIGUSR2, write_to_signal_pipe); // enter boot mode (same as --boot-mode)
-    setUnixSignalHandler(SIGPIPE, write_to_signal_pipe); // broken invoker's pipe
+    /* A broken invoker pipe must not raise SIGPIPE. The handler writes to
+     * stderr before it touches the signal pipe, so when that write fails on a
+     * broken stderr socket it raised SIGPIPE into the same handler, which
+     * filled the signal pipe with SIGPIPE bytes and wedged the process
+     * (issue #16). Ignored, such a write returns EPIPE instead. */
+    setUnixSignalHandler(SIGPIPE, SIG_IGN);
     setUnixSignalHandler(SIGHUP,  write_to_signal_pipe); // re-exec
 
     if (!Daemon::m_instance) {
@@ -339,6 +358,14 @@ Daemon::Daemon(int & argc, char * argv[]) :
     if (pipe(m_sigPipeFd) == -1) {
         throw std::runtime_error("Daemon: Creating a pipe for Unix signals failed!\n");
     }
+
+    /* The handler must never block. Writing one byte per signal into a full
+     * pipe used to park the process in pipe_write forever (issue #16), so the
+     * write end is non-blocking: a full pipe drops the wakeup byte, and
+     * noteSignal() has already recorded the signal for the loop to handle. */
+    int sigPipeFlags = fcntl(m_sigPipeFd[1], F_GETFL);
+    if (sigPipeFlags != -1)
+        fcntl(m_sigPipeFd[1], F_SETFL, sigPipeFlags | O_NONBLOCK);
 }
 
 Daemon * Daemon::instance()
@@ -416,8 +443,15 @@ void Daemon::run(Booster *booster)
             // Check if we got SIGCHLD, SIGTERM, SIGUSR1 or SIGUSR2
             if (FD_ISSET(m_sigPipeFd[0], &rfds)) {
                 Logger::logDebug("Daemon: FD_ISSET(m_sigPipeFd[0])");
-                int dataReceived = read_from_signal_pipe(m_sigPipeFd[0]);
+                read_from_signal_pipe(m_sigPipeFd[0]);
+                clearSigWakeup();
+            }
 
+            // Handle every signal the handler recorded. The byte in the pipe
+            // is only a wakeup, so a pipe that was too full to carry one
+            // cannot lose a signal.
+            for (int dataReceived = takePendingSignal(); dataReceived != 0;
+                 dataReceived = takePendingSignal()) {
                 switch (dataReceived) {
                 case SIGCHLD:
                     Logger::logDebug("Daemon: SIGCHLD received.");
@@ -497,7 +531,6 @@ void Daemon::run(Booster *booster)
                 default:
                     break;
                 }
-                continue;
             }
 
             /* Handle closed booster sockets */
@@ -985,6 +1018,33 @@ int Daemon::sigPipeFd() const
     return m_sigPipeFd[1];
 }
 
+bool Daemon::noteSignal(int signum)
+{
+    /* Atomic: the main loop clears bits in m_sigPending while a handler can
+     * set one, and the flag decides who writes the wakeup byte. */
+    __sync_fetch_and_or(&m_sigPending, (1 << signum));
+    if (__sync_lock_test_and_set(&m_sigWakeupSent, 1))
+        return false;
+    return true;
+}
+
+int Daemon::takePendingSignal()
+{
+    for (int signum = 1; signum < 32; signum++) {
+        if (m_sigPending & (1 << signum)) {
+            int previous = __sync_fetch_and_and(&m_sigPending, ~(1 << signum));
+            if (previous & (1 << signum))
+                return signum;
+        }
+    }
+    return 0;
+}
+
+void Daemon::clearSigWakeup()
+{
+    __sync_lock_release(&m_sigWakeupSent);
+}
+
 void Daemon::enterNormalMode()
 {
     if (m_bootMode) {
@@ -1031,6 +1091,16 @@ void Daemon::setUnixSignalHandler(int signum, sighandler_t handler)
     memset(&sig, 0, sizeof(sig));
     sig.sa_flags = SA_RESTART;
     sig.sa_handler = handler;
+    /* The handlers share the recorded-signal mask and the wakeup flag, so one
+     * must not nest inside another: block the signals this class handles
+     * (and only those, so a crash still interrupts) while one of them runs. */
+    sigemptyset(&sig.sa_mask);
+    sigaddset(&sig.sa_mask, SIGCHLD);
+    sigaddset(&sig.sa_mask, SIGINT);
+    sigaddset(&sig.sa_mask, SIGTERM);
+    sigaddset(&sig.sa_mask, SIGUSR1);
+    sigaddset(&sig.sa_mask, SIGUSR2);
+    sigaddset(&sig.sa_mask, SIGHUP);
     if (sigaction(signum, &sig, NULL) == -1)
         warning("trap(%s): %m", strsignal(signum));
     else
